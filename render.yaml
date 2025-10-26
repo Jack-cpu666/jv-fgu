@@ -24,4 +24,4 @@ services:
       - key: PASSWORD
         sync: false
       - key: AUTO_TOKEN_REFRESH
-        value: "false"
+        value: "true"
