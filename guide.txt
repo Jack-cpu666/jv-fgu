@@ -190,6 +190,40 @@ SECURITY CONSIDERATIONS
 TROUBLESHOOTING
 ================================================================================
 
+COMMON ERRORS AND SOLUTIONS:
+-----------------------------
+
+1. "TemplateAssertionError: block 'content' defined twice"
+   SOLUTION: Fixed in latest version. If you see this error:
+   - Re-download the updated app.py
+   - Make sure you're using the latest version
+   - The helper function render_content() handles templates correctly
+
+2. "Internal Server Error" on login
+   SOLUTION: Usually means template error. Check:
+   - app.py is the latest version
+   - No manual edits to template sections
+   - Check logs for specific error
+
+3. Token refresh not working:
+   - Check Selenium is installed
+   - Verify Chrome/Edge/Firefox available
+   - Check EMAIL and PASSWORD are correct
+   - Look at console logs for errors
+   - Try manual "Get New Token" button
+
+4. Selenium not available:
+   - Install with: pip install selenium==4.16.0
+   - For Render: Add Chrome buildpack
+   - For Docker: Use provided Dockerfile
+   - Dashboard will show "Selenium not installed"
+
+5. Token still expires:
+   - Check AUTO_TOKEN_REFRESH=true
+   - Verify credentials are correct
+   - Check network connectivity
+   - Review error messages on dashboard
+
 If deployment fails:
 1. Check build logs in Render dashboard
 2. Verify all environment variables are set

@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: metropolis-parking
+    env: python
+    region: oregon
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.0
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: AUTH_KEY
+        sync: false
+      - key: BASE_URL
+        value: https://specialist.api.metropolis.io
+      - key: SITE_ID
+        value: "4005"
+      - key: EMAIL
+        sync: false
+      - key: PASSWORD
+        sync: false
+      - key: AUTO_TOKEN_REFRESH
+        value: "false"

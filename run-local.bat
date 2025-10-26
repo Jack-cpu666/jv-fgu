@@ -36,7 +36,7 @@ if /i "%selenium%"=="y" (
 REM Set environment variables for testing
 for /f %%i in ('python -c "import secrets; print(secrets.token_hex(32))"') do set SECRET_KEY=%%i
 set ADMIN_PASSWORD=admin
-set PORT=5000
+set PORT=10000
 
 echo.
 echo ==================================================================================
@@ -46,7 +46,7 @@ echo.
 echo Your login credentials:
 echo    Password: admin
 echo.
-echo Starting server at: http://localhost:5000
+echo Starting server at: http://localhost:10000
 echo.
 echo Press Ctrl+C to stop the server
 echo ==================================================================================

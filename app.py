@@ -1,5 +1,4 @@
-from flask import Flask, render_template, render_template_string, request, redirect, url_for, session, flash
-
+from flask import Flask, render_template, render_template_string, request, jsonify, session, redirect, url_for, flash, get_flashed_messages
 import requests
 import json
 import os
@@ -28,12 +27,62 @@ PASSWORD = os.environ.get('PASSWORD', '555_Security')
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin555')
 AUTO_TOKEN_REFRESH = os.environ.get('AUTO_TOKEN_REFRESH', 'true').lower() == 'true'
 
+# Storage files (matches WORKING_GATE_OPENER.py)
+MEMBERS_FILE = "memberships.json"
+BLACKLIST_FILE = "blacklist.json"
+
 # In-memory storage
 member_plates = []
 blacklist_plates = []
 monitoring_active = False
 token_status = {'valid': False, 'last_check': None, 'last_refresh': None, 'error': None}
 token_monitor_thread = None
+
+def load_members():
+    """Load member plates from JSON file"""
+    global member_plates
+    if os.path.exists(MEMBERS_FILE):
+        try:
+            with open(MEMBERS_FILE, 'r') as f:
+                member_plates = json.load(f)
+            logger.info(f"Loaded {len(member_plates)} member plates")
+        except Exception as e:
+            logger.error(f"Error loading members: {e}")
+            member_plates = []
+    else:
+        member_plates = []
+
+def save_members():
+    """Save member plates to JSON file"""
+    try:
+        with open(MEMBERS_FILE, 'w') as f:
+            json.dump(member_plates, f, indent=2)
+        logger.info(f"Saved {len(member_plates)} member plates")
+    except Exception as e:
+        logger.error(f"Error saving members: {e}")
+
+def load_blacklist():
+    """Load blacklisted plates from JSON file"""
+    global blacklist_plates
+    if os.path.exists(BLACKLIST_FILE):
+        try:
+            with open(BLACKLIST_FILE, 'r') as f:
+                blacklist_plates = json.load(f)
+            logger.info(f"Loaded {len(blacklist_plates)} blacklisted plates")
+        except Exception as e:
+            logger.error(f"Error loading blacklist: {e}")
+            blacklist_plates = []
+    else:
+        blacklist_plates = []
+
+def save_blacklist():
+    """Save blacklisted plates to JSON file"""
+    try:
+        with open(BLACKLIST_FILE, 'w') as f:
+            json.dump(blacklist_plates, f, indent=2)
+        logger.info(f"Saved {len(blacklist_plates)} blacklisted plates")
+    except Exception as e:
+        logger.error(f"Error saving blacklist: {e}")
 
 # Try importing Selenium for auto token refresh
 HAS_SELENIUM = False
@@ -53,16 +102,20 @@ except ImportError:
 def verify_token():
     """Verify if current token is valid by making a test API call"""
     global AUTH_KEY, token_status
-    
+
     try:
-        url = f"{BASE_URL}/api/sites/{SITE_ID}/gates"
+        # Use the correct endpoint format (singular "site" not "sites")
+        url = f"{BASE_URL}/api/site/{SITE_ID}/occupancy"
         headers = {
             "Authorization": f"Bearer {AUTH_KEY}",
-            "Accept": "application/json"
+            "Accept": "*/*"
         }
-        
-        response = requests.get(url, headers=headers, timeout=5)
-        
+
+        logger.info(f"Verifying token... (length: {len(AUTH_KEY)}, dots: {AUTH_KEY.count('.')})")
+        response = requests.get(url, headers=headers, timeout=10)
+
+        logger.info(f"Verification response: {response.status_code}")
+
         if response.status_code == 200:
             token_status['valid'] = True
             token_status['last_check'] = datetime.now()
@@ -72,12 +125,14 @@ def verify_token():
         elif response.status_code == 401:
             token_status['valid'] = False
             token_status['error'] = 'Token expired or invalid'
-            logger.warning("❌ Token is invalid/expired")
+            logger.warning(f"❌ Token is invalid/expired - Response: {response.text[:200]}")
             return False
         else:
-            token_status['error'] = f'Unexpected status: {response.status_code}'
+            error_msg = f'Unexpected status: {response.status_code}'
+            token_status['error'] = error_msg
+            logger.warning(f"⚠️ {error_msg} - Response: {response.text[:200]}")
             return False
-            
+
     except Exception as e:
         token_status['error'] = str(e)
         logger.error(f"Error verifying token: {e}")
@@ -167,64 +222,79 @@ def get_new_token_selenium():
         password_field.send_keys(Keys.RETURN)
         time.sleep(5)
         
-        # Inject JavaScript to capture token
+        # Inject JavaScript to capture token (using exact logic from get token.py)
         logger.info("Injecting token interceptor...")
         intercept_script = """
         window.capturedToken = null;
-        
+
         // Override fetch
         const originalFetch = window.fetch;
         window.fetch = function(...args) {
             const [url, config] = args;
-            
+
+            // Capture Authorization header
             if (config && config.headers) {
                 const auth = config.headers['Authorization'] || config.headers['authorization'];
                 if (auth && auth.startsWith('Bearer ')) {
                     window.capturedToken = auth.replace('Bearer ', '');
-                    console.log('Token captured!');
+                    console.log('✅ Captured token from fetch!');
                 }
             }
-            
+
             return originalFetch.apply(this, args);
         };
-        
+
         // Override XMLHttpRequest
+        const originalOpen = XMLHttpRequest.prototype.open;
         const originalSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+
+        XMLHttpRequest.prototype.open = function(...args) {
+            this._requestHeaders = {};
+            return originalOpen.apply(this, args);
+        };
+
         XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
+            this._requestHeaders[header] = value;
+
             if (header.toLowerCase() === 'authorization' && value.startsWith('Bearer ')) {
                 window.capturedToken = value.replace('Bearer ', '');
-                console.log('Token captured from XHR!');
+                console.log('✅ Captured token from XHR!');
             }
+
             return originalSetHeader.apply(this, arguments);
         };
-        
-        console.log('Interceptor installed');
+
+        console.log('🎣 Fetch interceptor installed!');
         """
-        
+
         driver.execute_script(intercept_script)
-        
-        # Wait for token capture
+
+        # Wait for token capture (using exact logic from get token.py)
+        logger.info("Waiting for API call to capture token...")
         token = None
-        for i in range(30):
+        for i in range(30):  # Check for 30 seconds
             time.sleep(1)
             token = driver.execute_script("return window.capturedToken;")
-            
+
             if token:
-                logger.info(f"✅ Token captured after {i+1} seconds")
+                logger.info(f"✅ TOKEN CAPTURED after {i+1} seconds!")
+                logger.info(f"Token length: {len(token)} chars")
+                logger.info(f"Token preview: {token[:50]}...")
                 break
-            
-            # Trigger API call by refreshing
+
+            # Trigger a page interaction to force API calls
             if i == 5:
                 logger.info("Refreshing page to trigger API calls...")
                 driver.refresh()
                 time.sleep(2)
-                driver.execute_script(intercept_script)
+                driver.execute_script(intercept_script)  # Re-inject after refresh
         
         if token:
             logger.info("🎉 Successfully obtained new token")
             return token
         else:
-            logger.error("Failed to capture token")
+            logger.error("❌ No token captured after 30 seconds")
+            logger.info("💡 The page might not have made any API calls.")
             return None
             
     except Exception as e:
@@ -330,6 +400,12 @@ def stop_token_monitor():
     
     monitoring_active = False
     logger.info("Token monitor stop requested")
+
+def render_content(content, **kwargs):
+    """Helper function to properly render content in the HTML template"""
+    full_template = HTML_TEMPLATE.replace('{% block content %}{% endblock %}', 
+                                          '{% block content %}' + content + '{% endblock %}')
+    return render_template_string(full_template, **kwargs)
 
 def login_required(f):
     @wraps(f)
@@ -869,8 +945,7 @@ def dashboard():
         'selenium_available': HAS_SELENIUM
     }
     
-    return render_template_string(HTML_TEMPLATE + '''
-    {% block content %}
+    content = '''
     <div class="row">
         <div class="col-12">
             <h1 class="mb-4">Dashboard</h1>
@@ -995,12 +1070,6 @@ def dashboard():
     </div>
     
     <script>
-        // Auto-refresh occupancy
-        autoRefresh('occupancy-555', '/api/occupancy/4005', 5000);
-        autoRefresh('occupancy-boa', '/api/occupancy/4007', 5000);
-        autoRefresh('waiting-count', '/api/waiting-count', 5000);
-        autoRefresh('recent-transactions', '/api/recent-transactions', 3000);
-        
         // Token management functions
         function testToken() {
             fetch('/api/test-token')
@@ -1043,9 +1112,18 @@ def dashboard():
                     btn.innerHTML = '<i class="fas fa-sync"></i> Get New Token';
                 });
         }
+
+        // Auto-refresh occupancy and transactions after page loads
+        $(document).ready(function() {
+            autoRefresh('occupancy-555', '/api/occupancy/4005', 5000);
+            autoRefresh('occupancy-boa', '/api/occupancy/4007', 5000);
+            autoRefresh('waiting-count', '/api/waiting-count', 5000);
+            autoRefresh('recent-transactions', '/api/recent-transactions', 3000);
+        });
     </script>
-    {% endblock %}
-    ''', member_count=len(member_plates), token_info=token_info)
+    '''
+    
+    return render_content(content, member_count=len(member_plates), token_info=token_info)
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -1066,52 +1144,33 @@ def logout():
 @app.route('/gates')
 @login_required
 def gates():
-    return render_template_string(HTML_TEMPLATE + '''
-    {% block content %}
+    content = '''
     <div class="row">
         <div class="col-12">
             <h1 class="mb-4">Gate Control</h1>
         </div>
     </div>
-    
+
     <div class="row">
         <!-- 555 Capitol Mall Gates -->
         <div class="col-md-6">
             <div class="dashboard-card">
                 <h3 class="text-center mb-4">555 Capitol Mall</h3>
-                <button class="gate-btn entry" onclick="openGate('17491', 'Entry Lane 1 (17491)', '4005')">
-                    <i class="fas fa-arrow-down"></i> Entry Lane 1
+                <button class="gate-btn exit" onclick="openGate('5568', '6th Street Exit', '4005')">
+                    <i class="fas fa-door-open"></i> 6th Street Exit
                 </button>
-                <button class="gate-btn entry" onclick="openGate('17492', 'Entry Lane 2 (17492)', '4005')">
-                    <i class="fas fa-arrow-down"></i> Entry Lane 2
-                </button>
-                <button class="gate-btn exit" onclick="openGate('17493', 'Exit Lane 3 (17493)', '4005')">
-                    <i class="fas fa-arrow-up"></i> Exit Lane 3
-                </button>
-                <button class="gate-btn exit" onclick="openGate('17494', 'Exit Lane 4 (17494)', '4005')">
-                    <i class="fas fa-arrow-up"></i> Exit Lane 4
-                </button>
-                <button class="gate-btn exit" onclick="openGate('17495', 'Exit Lane 5 (17495)', '4005')">
-                    <i class="fas fa-arrow-up"></i> Exit Lane 5
+                <button class="gate-btn exit" onclick="openGate('5569', 'L Street Exit', '4005')">
+                    <i class="fas fa-door-open"></i> L Street Exit
                 </button>
             </div>
         </div>
-        
+
         <!-- Bank of America Gates -->
         <div class="col-md-6">
             <div class="dashboard-card">
                 <h3 class="text-center mb-4">Bank of America</h3>
-                <button class="gate-btn entry" onclick="openGate('21173', 'Entry Lane 1 (21173)', '4007')">
-                    <i class="fas fa-arrow-down"></i> Entry Lane 1
-                </button>
-                <button class="gate-btn entry" onclick="openGate('21174', 'Entry Lane 2 (21174)', '4007')">
-                    <i class="fas fa-arrow-down"></i> Entry Lane 2
-                </button>
-                <button class="gate-btn exit" onclick="openGate('21175', 'Exit Lane 3 (21175)', '4007')">
-                    <i class="fas fa-arrow-up"></i> Exit Lane 3
-                </button>
-                <button class="gate-btn exit" onclick="openGate('21176', 'Exit Lane 4 (21176)', '4007')">
-                    <i class="fas fa-arrow-up"></i> Exit Lane 4
+                <button class="gate-btn exit" onclick="openGate('5565', 'Bank of America Exit', '4007')">
+                    <i class="fas fa-door-open"></i> Bank of America Exit
                 </button>
             </div>
         </div>
@@ -1127,79 +1186,98 @@ def gates():
             </div>
         </div>
     </div>
-    {% endblock %}
-    ''')
+    '''
+    
+    return render_content(content)
 
 @app.route('/transactions')
-@login_required  
+@login_required
 def transactions():
-    return render_template_string(HTML_TEMPLATE + '''
-    {% block content %}
+    content = '''
     <div class="row">
         <div class="col-12">
-            <h1 class="mb-4">Transaction Search</h1>
+            <h1 class="mb-4">
+                <i class="fas fa-receipt"></i> Live Vehicle Activity
+            </h1>
         </div>
     </div>
-    
-    <div class="dashboard-card">
-        <form onsubmit="searchTransactions(event); return false;">
-            <div class="row">
-                <div class="col-md-4">
-                    <label>License Plate</label>
-                    <input type="text" class="form-control" id="search-plate" placeholder="Enter plate number">
-                </div>
-                <div class="col-md-4">
-                    <label>Site</label>
-                    <select class="form-control" id="search-site">
-                        <option value="4005">555 Capitol Mall</option>
-                        <option value="4007">Bank of America</option>
-                        <option value="all">All Sites</option>
-                    </select>
-                </div>
-                <div class="col-md-4">
-                    <label>&nbsp;</label>
-                    <button type="submit" class="btn btn-custom w-100">
-                        <i class="fas fa-search"></i> Search
-                    </button>
-                </div>
+
+    <div class="dashboard-card mb-3">
+        <div class="row">
+            <div class="col-md-4">
+                <label>Filter by Plate</label>
+                <input type="text" class="form-control" id="filter-plate" placeholder="Enter plate number">
             </div>
-        </form>
-    </div>
-    
-    <div class="dashboard-card mt-4">
-        <h3>Search Results</h3>
-        <div id="transaction-results" style="max-height: 600px; overflow-y: auto;">
-            <p class="text-muted">Enter search criteria above</p>
+            <div class="col-md-3">
+                <label>Site</label>
+                <select class="form-control" id="filter-site">
+                    <option value="all">All Sites</option>
+                    <option value="4005">555 Capitol Mall</option>
+                    <option value="4007">Bank of America</option>
+                </select>
+            </div>
+            <div class="col-md-3">
+                <label>Type</label>
+                <select class="form-control" id="filter-type">
+                    <option value="all">Entry & Exit</option>
+                    <option value="entry">Entry Only</option>
+                    <option value="exit">Exit Only</option>
+                </select>
+            </div>
+            <div class="col-md-2">
+                <label>&nbsp;</label>
+                <button class="btn btn-custom w-100" onclick="loadTransactions()">
+                    <i class="fas fa-sync"></i> Refresh
+                </button>
+            </div>
         </div>
     </div>
-    
+
+    <!-- Transaction Cards Container -->
+    <div id="transaction-cards" style="max-height: 700px; overflow-y: auto;">
+        <div class="text-center">
+            <div class="loading-spinner"></div>
+            <p>Loading recent activity...</p>
+        </div>
+    </div>
+
     <script>
-        function searchTransactions(e) {
-            e.preventDefault();
-            const plate = document.getElementById('search-plate').value;
-            const site = document.getElementById('search-site').value;
-            
-            document.getElementById('transaction-results').innerHTML = '<div class="loading-spinner"></div> Searching...';
-            
-            fetch('/api/search-transactions', {
+        function loadTransactions() {
+            const plate = document.getElementById('filter-plate').value;
+            const site = document.getElementById('filter-site').value;
+            const type = document.getElementById('filter-type').value;
+
+            document.getElementById('transaction-cards').innerHTML =
+                '<div class="text-center"><div class="loading-spinner"></div><p>Loading...</p></div>';
+
+            fetch('/api/recent-activity', {
                 method: 'POST',
                 headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify({plate: plate, site: site})
+                body: JSON.stringify({plate: plate, site: site, type: type})
             })
             .then(response => response.json())
             .then(data => {
-                document.getElementById('transaction-results').innerHTML = data.html;
+                document.getElementById('transaction-cards').innerHTML = data.html;
+            })
+            .catch(error => {
+                document.getElementById('transaction-cards').innerHTML =
+                    '<div class="alert alert-danger">Error loading activity: ' + error + '</div>';
             });
         }
+
+        // Auto-load on page load
+        loadTransactions();
+
+        // Auto-refresh every 10 seconds
+        setInterval(loadTransactions, 10000);
     </script>
-    {% endblock %}
-    ''')
+    '''
+    return render_content(content)
 
 @app.route('/members')
 @login_required
 def members():
-    return render_template_string(HTML_TEMPLATE + '''
-    {% block content %}
+    content = '''
     <div class="row">
         <div class="col-12">
             <h1 class="mb-4">Member Management</h1>
@@ -1316,15 +1394,15 @@ def members():
             </div>
         </div>
     </div>
-    {% endblock %}
-    ''', members=member_plates, blacklist=[{'plate': p} for p in blacklist_plates], 
-        current_time=datetime.now().strftime('%Y-%m-%d %H:%M'))
+    '''
+    return render_content(content, members=member_plates, 
+                         blacklist=[{'plate': p} for p in blacklist_plates], 
+                         current_time=datetime.now().strftime('%Y-%m-%d %H:%M'))
 
 @app.route('/visitor')
 @login_required
 def visitor():
-    return render_template_string(HTML_TEMPLATE + '''
-    {% block content %}
+    content = '''
     <div class="row">
         <div class="col-12">
             <h1 class="mb-4">Create Visitor Pass</h1>
@@ -1377,42 +1455,57 @@ def visitor():
             </div>
         </div>
     </div>
-    {% endblock %}
-    ''')
+    '''
+    return render_content(content)
 
 @app.route('/cameras')
 @login_required
 def cameras():
-    return render_template_string(HTML_TEMPLATE + '''
-    {% block content %}
+    content = '''
     <div class="row">
         <div class="col-12">
-            <h1 class="mb-4">Camera Feeds</h1>
+            <h1 class="mb-4">
+                <i class="fas fa-users"></i> Member Directory
+            </h1>
+            <p class="text-muted">All members with active subscriptions or recent visits</p>
         </div>
     </div>
-    
-    <div class="alert alert-info">
-        <i class="fas fa-info-circle"></i> Camera feeds update automatically every 5 seconds
+
+    <!-- Member Directory Container -->
+    <div id="member-directory-container" style="max-height: 700px; overflow-y: auto;">
+        <div class="text-center">
+            <div class="loading-spinner"></div>
+            <p>Loading member directory...</p>
+        </div>
     </div>
-    
-    <div class="row" id="camera-grid">
-        <!-- Cameras will be loaded here -->
+
+    <div class="text-center mt-3">
+        <button class="btn btn-custom" onclick="loadMemberDirectory()">
+            <i class="fas fa-sync"></i> Refresh Directory
+        </button>
     </div>
-    
+
     <script>
-        function loadCameras() {
-            fetch('/api/camera-feeds')
+        function loadMemberDirectory() {
+            document.getElementById('member-directory-container').innerHTML =
+                '<div class="text-center"><div class="loading-spinner"></div><p>Loading...</p></div>';
+
+            fetch('/api/member-directory')
                 .then(response => response.json())
                 .then(data => {
-                    document.getElementById('camera-grid').innerHTML = data.html;
+                    document.getElementById('member-directory-container').innerHTML = data.html;
+                })
+                .catch(error => {
+                    document.getElementById('member-directory-container').innerHTML =
+                        '<div class="alert alert-danger">Error loading directory: ' + error + '</div>';
                 });
         }
-        
-        loadCameras();
-        setInterval(loadCameras, 5000);
+
+        // Load immediately
+        loadMemberDirectory();
     </script>
-    {% endblock %}
-    ''')
+    '''
+    return render_content(content)
 
 # API Routes
 @app.route('/api/open-gate', methods=['POST'])
@@ -1422,21 +1515,46 @@ def api_open_gate():
     lane_id = data.get('lane_id')
     gate_name = data.get('gate_name')
     site_id = data.get('site_id', SITE_ID)
-    
-    url = f"{BASE_URL}/api/specialist/site/{site_id}/lane/{lane_id}/open-gate"
+    visit_id = data.get('visit_id', None)  # Optional visitId parameter
+
+    # Build endpoint - matches WORKING_GATE_OPENER.py exactly
+    endpoint = f"/api/specialist/site/{site_id}/lane/{lane_id}/open-gate"
+
+    # Add visitId parameter if provided
+    if visit_id:
+        endpoint += f"?visitId={visit_id}"
+
+    url = BASE_URL + endpoint
+
+    # Headers match WORKING_GATE_OPENER.py exactly
     headers = {
         "Authorization": f"Bearer {AUTH_KEY}",
         "Accept": "*/*",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "Origin": "https://specialist.metropolis.io",
+        "Referer": "https://specialist.metropolis.io/",
+        "User-Agent": "Mozilla/5.0"
     }
-    
+
     try:
+        logger.info(f"Opening gate: POST {endpoint}")
         response = requests.post(url, headers=headers, timeout=10)
+        logger.info(f"Status: {response.status_code}")
+
+        # Accept 200, 201, or 204 as success (matches working script)
         if response.status_code in [200, 201, 204]:
+            try:
+                response_data = response.json()
+                logger.info(f"Response: {response_data}")
+            except:
+                # No JSON response, but success status
+                pass
             return jsonify({'success': True, 'message': f'{gate_name} opened successfully'})
         else:
+            logger.error(f"Error response: {response.text}")
             return jsonify({'success': False, 'message': f'Failed with status {response.status_code}'})
     except Exception as e:
+        logger.error(f"Error opening gate: {e}")
         return jsonify({'success': False, 'message': str(e)})
 
 @app.route('/api/occupancy/<site_id>')
@@ -1507,7 +1625,9 @@ def api_add_member():
     plate = request.json.get('plate', '').upper()
     if plate and plate not in member_plates:
         member_plates.append(plate)
-        return jsonify({'success': True})
+        save_members()  # Save to file
+        logger.info(f"Added member: {plate}")
+        return jsonify({'success': True, 'message': f'Added {plate} to members'})
     return jsonify({'success': False, 'message': 'Plate already exists or invalid'})
 
 @app.route('/api/members/remove', methods=['POST'])
@@ -1516,8 +1636,10 @@ def api_remove_member():
     plate = request.json.get('plate', '').upper()
     if plate in member_plates:
         member_plates.remove(plate)
-        return jsonify({'success': True})
-    return jsonify({'success': False})
+        save_members()  # Save to file
+        logger.info(f"Removed member: {plate}")
+        return jsonify({'success': True, 'message': f'Removed {plate}'})
+    return jsonify({'success': False, 'message': 'Plate not found'})
 
 @app.route('/api/blacklist/add', methods=['POST'])
 @login_required
@@ -1525,7 +1647,9 @@ def api_add_blacklist():
     plate = request.json.get('plate', '').upper()
     if plate and plate not in blacklist_plates:
         blacklist_plates.append(plate)
-        return jsonify({'success': True})
+        save_blacklist()  # Save to file
+        logger.warning(f"Blacklisted plate: {plate}")
+        return jsonify({'success': True, 'message': f'Blacklisted {plate}'})
     return jsonify({'success': False, 'message': 'Plate already blacklisted or invalid'})
 
 @app.route('/api/blacklist/remove', methods=['POST'])
@@ -1534,8 +1658,10 @@ def api_remove_blacklist():
     plate = request.json.get('plate', '').upper()
     if plate in blacklist_plates:
         blacklist_plates.remove(plate)
-        return jsonify({'success': True})
-    return jsonify({'success': False})
+        save_blacklist()  # Save to file
+        logger.info(f"Removed from blacklist: {plate}")
+        return jsonify({'success': True, 'message': f'Removed {plate} from blacklist'})
+    return jsonify({'success': False, 'message': 'Plate not found'})
 
 @app.route('/api/visitor-pass', methods=['POST'])
 @login_required
@@ -1556,42 +1682,179 @@ def api_visitor_pass():
         'site': site_name
     })
 
-@app.route('/api/camera-feeds')
+@app.route('/api/camera-feeds-live')
 @login_required
-def api_camera_feeds():
+def api_camera_feeds_live():
+    """Get live camera feeds with actual vehicle images - matches WORKING_GATE_OPENER.py"""
     html = ''
-    cameras = {
-        '4005': [
-            {'name': 'Entry Lane 1', 'lane': '17491'},
-            {'name': 'Entry Lane 2', 'lane': '17492'},
-            {'name': 'Exit Lane 3', 'lane': '17493'},
-            {'name': 'Exit Lane 4', 'lane': '17494'},
-        ],
-        '4007': [
-            {'name': 'Entry Lane 1', 'lane': '21173'},
-            {'name': 'Entry Lane 2', 'lane': '21174'},
-            {'name': 'Exit Lane 3', 'lane': '21175'},
-            {'name': 'Exit Lane 4', 'lane': '21176'},
-        ]
-    }
-    
-    for site_id, cams in cameras.items():
+
+    for site_id in ['4005', '4007']:
         site_name = "555 Capitol Mall" if site_id == "4005" else "Bank of America"
-        for cam in cams:
-            html += f'''
-            <div class="col-md-3 mb-4">
-                <div class="camera-feed">
-                    <h5>{site_name}</h5>
-                    <h6>{cam['name']}</h6>
-                    <div style="height: 200px; background: #333; display: flex; align-items: center; justify-content: center;">
-                        <i class="fas fa-video fa-3x text-muted"></i>
-                    </div>
-                    <small class="text-muted">Lane {cam['lane']}</small>
-                </div>
-            </div>
-            '''
-    
+
+        url = f"{BASE_URL}/api/specialist/site/{site_id}/visits/closed?count=10"
+        headers = {"Authorization": f"Bearer {AUTH_KEY}", "Accept": "*/*"}
+
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                api_data = response.json()
+                if api_data.get('success'):
+                    transactions = api_data.get('data', {}).get('transactions', [])
+
+                    for t in transactions[:10]:  # Show latest 10
+                        vehicle = t.get('vehicle', {})
+                        plate_obj = vehicle.get('licensePlate', {})
+                        plate = plate_obj.get('text', 'N/A')
+                        state = plate_obj.get('state', {}).get('name', 'CA')
+
+                        images = t.get('images', {})
+
+                        # Show EXIT events (most recent activity)
+                        exit_event = images.get('exitEvent')
+                        if exit_event:
+                            html += create_vehicle_card_html(t, exit_event, plate, state, is_entry=False)
+
+                        # Also show ENTRY events
+                        entry_event = images.get('entryEvent')
+                        if entry_event:
+                            html += create_vehicle_card_html(t, entry_event, plate, state, is_entry=True)
+
+        except Exception as e:
+            logger.error(f"Error fetching camera feeds: {e}")
+
+    if not html:
+        html = '<div class="alert alert-info text-center">No recent camera activity</div>'
+
     return jsonify({'html': html})
+
+@app.route('/api/recent-activity', methods=['POST'])
+@login_required
+def api_recent_activity():
+    """Get recent vehicle activity with images - matches WORKING_GATE_OPENER.py layout"""
+    data = request.json
+    filter_plate = data.get('plate', '').upper()
+    filter_site = data.get('site', 'all')
+    filter_type = data.get('type', 'all')
+
+    html = ''
+    sites = ['4005', '4007'] if filter_site == 'all' else [filter_site]
+
+    for site_id in sites:
+        site_name = "555 Capitol Mall" if site_id == "4005" else "Bank of America"
+
+        # Header for site
+        html += f'''
+        <div style="background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+                    color: white; padding: 10px 20px; margin: 20px 0 10px 0;
+                    border-radius: 10px; font-weight: bold; font-size: 1.1rem;">
+            {site_name}
+        </div>
+        '''
+
+        url = f"{BASE_URL}/api/specialist/site/{site_id}/visits/closed?count=20"
+        headers = {"Authorization": f"Bearer {AUTH_KEY}", "Accept": "*/*"}
+
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                api_data = response.json()
+                if api_data.get('success'):
+                    transactions = api_data.get('data', {}).get('transactions', [])
+
+                    for t in transactions:
+                        vehicle = t.get('vehicle', {})
+                        plate_obj = vehicle.get('licensePlate', {})
+                        plate = plate_obj.get('text', 'N/A')
+                        state = plate_obj.get('state', {}).get('name', 'CA')
+
+                        # Filter by plate if specified
+                        if filter_plate and filter_plate not in plate.upper():
+                            continue
+
+                        images = t.get('images', {})
+
+                        # Process ENTRY event
+                        if filter_type in ['all', 'entry']:
+                            entry_event = images.get('entryEvent')
+                            if entry_event:
+                                html += create_vehicle_card_html(t, entry_event, plate, state, is_entry=True)
+
+                        # Process EXIT event
+                        if filter_type in ['all', 'exit']:
+                            exit_event = images.get('exitEvent')
+                            if exit_event:
+                                html += create_vehicle_card_html(t, exit_event, plate, state, is_entry=False)
+
+        except Exception as e:
+            logger.error(f"Error fetching activity: {e}")
+
+    if not html:
+        html = '<div class="alert alert-info text-center">No recent activity found</div>'
+
+    return jsonify({'html': html})
+
+def create_vehicle_card_html(transaction, event, plate, state, is_entry=True):
+    """Create HTML for a vehicle card matching WORKING_GATE_OPENER.py style"""
+
+    # Get timestamp
+    timestamp_ms = transaction.get('start') if is_entry else transaction.get('end')
+    if timestamp_ms:
+        dt = datetime.fromtimestamp(timestamp_ms / 1000)
+        time_str = dt.strftime('%I:%M %p')
+        date_str = dt.strftime('%m/%d/%Y')
+    else:
+        time_str = 'N/A'
+        date_str = ''
+
+    # Get lane info
+    equipment = event.get('siteEquipment') if event else None
+    lane_name = equipment.get('notes', 'Unknown Lane') if equipment else 'Unknown Lane'
+
+    # Get image URL
+    context_url = event.get('contextImageUrl', '') if event else ''
+
+    # Entry/Exit styling
+    direction_color = '#4CAF50' if is_entry else '#F44336'
+    direction_text = '→ ENTRY' if is_entry else '← EXIT'
+    direction_icon = 'fa-arrow-right' if is_entry else 'fa-arrow-left'
+
+    card_html = f'''
+    <div style="background: #2a2a2a; border-radius: 10px; padding: 15px; margin-bottom: 15px;
+                display: flex; align-items: center; box-shadow: 0 5px 15px rgba(0,0,0,0.3);">
+
+        <!-- Left: Image -->
+        <div style="flex-shrink: 0; margin-right: 20px;">
+            {f'<img src="{context_url}" style="width: 150px; height: 100px; object-fit: cover; border-radius: 5px; background: #000;" />'
+             if context_url else
+             '<div style="width: 150px; height: 100px; background: #000; border-radius: 5px; display: flex; align-items: center; justify-content: center; color: #666;"><i class="fas fa-camera" style="font-size: 2rem;"></i></div>'}
+        </div>
+
+        <!-- Middle: Info -->
+        <div style="flex-grow: 1;">
+            <!-- License Plate Badge -->
+            <div style="display: inline-block; background: #1E88E5; padding: 5px 15px; border-radius: 5px; margin-bottom: 8px;">
+                <span style="color: white; font-weight: bold; font-size: 1.2rem; margin-right: 10px;">{plate}</span>
+                <span style="background: white; color: black; padding: 2px 8px; border-radius: 3px; font-size: 0.9rem; font-weight: bold;">{state}</span>
+            </div>
+
+            <!-- Entry/Exit Indicator -->
+            <div style="color: {direction_color}; font-weight: bold; margin-bottom: 3px;">
+                <i class="fas {direction_icon}"></i> {direction_text}
+            </div>
+
+            <!-- Lane Name -->
+            <div style="color: #aaa; font-size: 0.9rem;">{lane_name}</div>
+        </div>
+
+        <!-- Right: Time -->
+        <div style="text-align: right; min-width: 120px;">
+            <div style="font-size: 1.3rem; font-weight: bold; color: white;">{time_str}</div>
+            <div style="font-size: 0.8rem; color: #888;">{date_str}</div>
+        </div>
+    </div>
+    '''
+
+    return card_html
 
 @app.route('/api/search-transactions', methods=['POST'])
 @login_required
@@ -1704,26 +1967,41 @@ def api_token_status():
     })
 
 if __name__ == '__main__':
+    logger.info("="*60)
+    logger.info("METROPOLIS PARKING MANAGEMENT SYSTEM - WEB APP")
+    logger.info("="*60)
+
+    # Load members and blacklist from files
+    logger.info("Loading member and blacklist data...")
+    load_members()
+    load_blacklist()
+    logger.info(f"Loaded {len(member_plates)} members and {len(blacklist_plates)} blacklisted plates")
+
     # Try to load token from file if it exists
     try:
         with open('auth_token.txt', 'r') as f:
             saved_token = f.read().strip()
-            if saved_token:
+            if saved_token and len(saved_token) > 100:  # Basic validation
                 AUTH_KEY = saved_token
-                logger.info("Loaded token from auth_token.txt")
-    except:
-        pass
-    
+                logger.info(f"✅ Loaded token from auth_token.txt (length: {len(saved_token)})")
+            else:
+                logger.warning("Token in auth_token.txt appears invalid")
+    except FileNotFoundError:
+        logger.info("No auth_token.txt found, using environment token")
+    except Exception as e:
+        logger.warning(f"Could not load token from file: {e}")
+
     # Start token monitor if enabled
     if AUTO_TOKEN_REFRESH:
         logger.info("Starting automatic token monitoring...")
         start_token_monitor()
-    
+
     # Verify initial token
     logger.info("Verifying initial token...")
     verify_token()
-    
+
     # Start Flask app
     port = int(os.environ.get('PORT', 10000))
     logger.info(f"Starting Flask app on port {port}...")
+    logger.info("="*60)
     app.run(host='0.0.0.0', port=port, debug=False)
