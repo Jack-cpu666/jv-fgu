@@ -9,6 +9,11 @@ import threading
 import time
 from functools import wraps
 import secrets
+import logging
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 app.config['SECRET_KEY'] = os.environ.get('SECRET_KEY', secrets.token_hex(32))
@@ -20,11 +25,310 @@ SITE_ID = os.environ.get('SITE_ID', '4005')
 EMAIL = os.environ.get('EMAIL', 'security@555capitolmall.com')
 PASSWORD = os.environ.get('PASSWORD', '555_Security')
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASSWORD', 'admin555')
+AUTO_TOKEN_REFRESH = os.environ.get('AUTO_TOKEN_REFRESH', 'true').lower() == 'true'
 
 # In-memory storage
 member_plates = []
 blacklist_plates = []
 monitoring_active = False
+token_status = {'valid': False, 'last_check': None, 'last_refresh': None, 'error': None}
+token_monitor_thread = None
+
+# Try importing Selenium for auto token refresh
+HAS_SELENIUM = False
+try:
+    from selenium import webdriver
+    from selenium.webdriver.common.by import By
+    from selenium.webdriver.common.keys import Keys
+    from selenium.webdriver.edge.options import Options as EdgeOptions
+    from selenium.webdriver.chrome.options import Options as ChromeOptions
+    from selenium.webdriver.firefox.options import Options as FirefoxOptions
+    HAS_SELENIUM = True
+    logger.info("✅ Selenium available - Auto token refresh enabled")
+except ImportError:
+    logger.warning("⚠️ Selenium not available - Auto token refresh disabled")
+    logger.warning("Install with: pip install selenium")
+
+def verify_token():
+    """Verify if current token is valid by making a test API call"""
+    global AUTH_KEY, token_status
+    
+    try:
+        url = f"{BASE_URL}/api/sites/{SITE_ID}/gates"
+        headers = {
+            "Authorization": f"Bearer {AUTH_KEY}",
+            "Accept": "application/json"
+        }
+        
+        response = requests.get(url, headers=headers, timeout=5)
+        
+        if response.status_code == 200:
+            token_status['valid'] = True
+            token_status['last_check'] = datetime.now()
+            token_status['error'] = None
+            logger.info("✅ Token is valid")
+            return True
+        elif response.status_code == 401:
+            token_status['valid'] = False
+            token_status['error'] = 'Token expired or invalid'
+            logger.warning("❌ Token is invalid/expired")
+            return False
+        else:
+            token_status['error'] = f'Unexpected status: {response.status_code}'
+            return False
+            
+    except Exception as e:
+        token_status['error'] = str(e)
+        logger.error(f"Error verifying token: {e}")
+        return False
+
+def get_new_token_selenium():
+    """Get a new token using headless Selenium"""
+    if not HAS_SELENIUM:
+        logger.error("Selenium not available")
+        return None
+    
+    driver = None
+    try:
+        logger.info("🤖 Starting headless token refresh...")
+        
+        # Try different browsers in order of preference
+        browsers = []
+        
+        # Try Edge first
+        try:
+            edge_options = EdgeOptions()
+            edge_options.add_argument('--headless')
+            edge_options.add_argument('--no-sandbox')
+            edge_options.add_argument('--disable-dev-shm-usage')
+            edge_options.add_argument('--disable-gpu')
+            edge_options.add_argument('--window-size=1920,1080')
+            edge_options.add_experimental_option('excludeSwitches', ['enable-logging'])
+            browsers.append(('edge', lambda: webdriver.Edge(options=edge_options)))
+        except:
+            pass
+        
+        # Try Chrome
+        try:
+            chrome_options = ChromeOptions()
+            chrome_options.add_argument('--headless')
+            chrome_options.add_argument('--no-sandbox')
+            chrome_options.add_argument('--disable-dev-shm-usage')
+            chrome_options.add_argument('--disable-gpu')
+            chrome_options.add_argument('--window-size=1920,1080')
+            chrome_options.add_experimental_option('excludeSwitches', ['enable-logging'])
+            browsers.append(('chrome', lambda: webdriver.Chrome(options=chrome_options)))
+        except:
+            pass
+        
+        # Try Firefox
+        try:
+            firefox_options = FirefoxOptions()
+            firefox_options.add_argument('--headless')
+            firefox_options.add_argument('--width=1920')
+            firefox_options.add_argument('--height=1080')
+            browsers.append(('firefox', lambda: webdriver.Firefox(options=firefox_options)))
+        except:
+            pass
+        
+        if not browsers:
+            logger.error("No browser drivers available")
+            return None
+        
+        # Try each browser until one works
+        for browser_name, browser_func in browsers:
+            try:
+                logger.info(f"Trying {browser_name}...")
+                driver = browser_func()
+                break
+            except Exception as e:
+                logger.warning(f"{browser_name} failed: {e}")
+                continue
+        
+        if not driver:
+            logger.error("Could not initialize any browser")
+            return None
+        
+        # Navigate to login page
+        login_url = f"https://specialist.metropolis.io/site/{SITE_ID}"
+        logger.info(f"Navigating to {login_url}")
+        driver.get(login_url)
+        time.sleep(3)
+        
+        # Login
+        logger.info("Logging in...")
+        email_field = driver.find_element(By.ID, "username")
+        email_field.send_keys(EMAIL)
+        time.sleep(1)
+        
+        password_field = driver.find_element(By.ID, "password")
+        password_field.send_keys(PASSWORD)
+        password_field.send_keys(Keys.RETURN)
+        time.sleep(5)
+        
+        # Inject JavaScript to capture token
+        logger.info("Injecting token interceptor...")
+        intercept_script = """
+        window.capturedToken = null;
+        
+        // Override fetch
+        const originalFetch = window.fetch;
+        window.fetch = function(...args) {
+            const [url, config] = args;
+            
+            if (config && config.headers) {
+                const auth = config.headers['Authorization'] || config.headers['authorization'];
+                if (auth && auth.startsWith('Bearer ')) {
+                    window.capturedToken = auth.replace('Bearer ', '');
+                    console.log('Token captured!');
+                }
+            }
+            
+            return originalFetch.apply(this, args);
+        };
+        
+        // Override XMLHttpRequest
+        const originalSetHeader = XMLHttpRequest.prototype.setRequestHeader;
+        XMLHttpRequest.prototype.setRequestHeader = function(header, value) {
+            if (header.toLowerCase() === 'authorization' && value.startsWith('Bearer ')) {
+                window.capturedToken = value.replace('Bearer ', '');
+                console.log('Token captured from XHR!');
+            }
+            return originalSetHeader.apply(this, arguments);
+        };
+        
+        console.log('Interceptor installed');
+        """
+        
+        driver.execute_script(intercept_script)
+        
+        # Wait for token capture
+        token = None
+        for i in range(30):
+            time.sleep(1)
+            token = driver.execute_script("return window.capturedToken;")
+            
+            if token:
+                logger.info(f"✅ Token captured after {i+1} seconds")
+                break
+            
+            # Trigger API call by refreshing
+            if i == 5:
+                logger.info("Refreshing page to trigger API calls...")
+                driver.refresh()
+                time.sleep(2)
+                driver.execute_script(intercept_script)
+        
+        if token:
+            logger.info("🎉 Successfully obtained new token")
+            return token
+        else:
+            logger.error("Failed to capture token")
+            return None
+            
+    except Exception as e:
+        logger.error(f"Error getting new token: {e}")
+        return None
+    finally:
+        if driver:
+            driver.quit()
+
+def refresh_token_if_needed():
+    """Check token and refresh if needed"""
+    global AUTH_KEY, token_status
+    
+    logger.info("🔍 Checking token status...")
+    
+    if verify_token():
+        logger.info("✅ Token is still valid")
+        return True
+    
+    logger.warning("⚠️ Token expired, attempting refresh...")
+    
+    if not HAS_SELENIUM:
+        logger.error("Cannot refresh - Selenium not available")
+        token_status['error'] = "Auto-refresh unavailable (Selenium not installed)"
+        return False
+    
+    new_token = get_new_token_selenium()
+    
+    if new_token:
+        AUTH_KEY = new_token
+        token_status['last_refresh'] = datetime.now()
+        
+        # Verify the new token works
+        if verify_token():
+            logger.info("✅ Token refreshed successfully")
+            
+            # Save to environment for persistence
+            os.environ['AUTH_KEY'] = new_token
+            
+            # Save to file as backup
+            try:
+                with open('auth_token.txt', 'w') as f:
+                    f.write(new_token)
+                logger.info("💾 Token saved to auth_token.txt")
+            except:
+                pass
+            
+            return True
+        else:
+            logger.error("New token verification failed")
+            return False
+    else:
+        logger.error("Failed to obtain new token")
+        return False
+
+def token_monitor_loop():
+    """Background thread that monitors and refreshes token"""
+    global token_status
+    
+    logger.info("🔄 Token monitor started")
+    
+    while monitoring_active:
+        try:
+            refresh_token_if_needed()
+            
+            # Wait 3 minutes before next check
+            for _ in range(180):  # 180 seconds = 3 minutes
+                if not monitoring_active:
+                    break
+                time.sleep(1)
+                
+        except Exception as e:
+            logger.error(f"Token monitor error: {e}")
+            token_status['error'] = str(e)
+            time.sleep(10)
+    
+    logger.info("Token monitor stopped")
+
+def start_token_monitor():
+    """Start the token monitoring thread"""
+    global monitoring_active, token_monitor_thread
+    
+    if not AUTO_TOKEN_REFRESH:
+        logger.info("Auto token refresh disabled by configuration")
+        return
+    
+    if not HAS_SELENIUM:
+        logger.warning("Auto token refresh unavailable - Selenium not installed")
+        return
+    
+    if monitoring_active:
+        logger.info("Token monitor already running")
+        return
+    
+    monitoring_active = True
+    token_monitor_thread = threading.Thread(target=token_monitor_loop, daemon=True)
+    token_monitor_thread.start()
+    logger.info("✅ Token monitor started")
+
+def stop_token_monitor():
+    """Stop the token monitoring thread"""
+    global monitoring_active
+    
+    monitoring_active = False
+    logger.info("Token monitor stop requested")
 
 def login_required(f):
     @wraps(f)
@@ -554,11 +858,66 @@ HTML_TEMPLATE = '''
 @app.route('/')
 @login_required
 def dashboard():
+    # Check token status
+    token_info = {
+        'valid': token_status.get('valid', False),
+        'last_check': token_status.get('last_check', 'Never').strftime('%Y-%m-%d %H:%M:%S') if isinstance(token_status.get('last_check'), datetime) else 'Never',
+        'last_refresh': token_status.get('last_refresh', 'Never').strftime('%Y-%m-%d %H:%M:%S') if isinstance(token_status.get('last_refresh'), datetime) else 'Never',
+        'error': token_status.get('error', None),
+        'auto_refresh': AUTO_TOKEN_REFRESH and HAS_SELENIUM,
+        'selenium_available': HAS_SELENIUM
+    }
+    
     return render_template_string(HTML_TEMPLATE + '''
     {% block content %}
     <div class="row">
         <div class="col-12">
             <h1 class="mb-4">Dashboard</h1>
+        </div>
+    </div>
+    
+    <!-- Token Status Card -->
+    <div class="row mb-4">
+        <div class="col-12">
+            <div class="dashboard-card" style="border-left: 4px solid {{ '#43a047' if token_info.valid else '#e53935' }};">
+                <div class="row align-items-center">
+                    <div class="col-md-8">
+                        <h4>
+                            <i class="fas fa-key"></i> API Token Status
+                            {% if token_info.valid %}
+                                <span class="badge bg-success ms-2">Valid</span>
+                            {% else %}
+                                <span class="badge bg-danger ms-2">Invalid/Expired</span>
+                            {% endif %}
+                        </h4>
+                        <p class="mb-1">
+                            <strong>Last Check:</strong> {{ token_info.last_check }}<br>
+                            <strong>Last Refresh:</strong> {{ token_info.last_refresh }}<br>
+                            <strong>Auto-Refresh:</strong> 
+                            {% if token_info.auto_refresh %}
+                                <span class="text-success">Enabled (every 3 minutes)</span>
+                            {% elif not token_info.selenium_available %}
+                                <span class="text-warning">Disabled (Selenium not installed)</span>
+                            {% else %}
+                                <span class="text-muted">Disabled</span>
+                            {% endif %}
+                        </p>
+                        {% if token_info.error %}
+                        <div class="alert alert-warning mb-0 mt-2">
+                            <i class="fas fa-exclamation-triangle"></i> {{ token_info.error }}
+                        </div>
+                        {% endif %}
+                    </div>
+                    <div class="col-md-4 text-end">
+                        <button class="btn btn-primary me-2" onclick="testToken()">
+                            <i class="fas fa-check-circle"></i> Test Token
+                        </button>
+                        <button class="btn btn-success" onclick="refreshToken()" {% if not token_info.selenium_available %}disabled title="Selenium not installed"{% endif %}>
+                            <i class="fas fa-sync"></i> Get New Token
+                        </button>
+                    </div>
+                </div>
+            </div>
         </div>
     </div>
     
@@ -640,9 +999,52 @@ def dashboard():
         autoRefresh('occupancy-boa', '/api/occupancy/4007', 5000);
         autoRefresh('waiting-count', '/api/waiting-count', 5000);
         autoRefresh('recent-transactions', '/api/recent-transactions', 3000);
+        
+        // Token management functions
+        function testToken() {
+            fetch('/api/test-token')
+                .then(response => response.json())
+                .then(data => {
+                    if (data.valid) {
+                        alert('✅ Token is valid and working!');
+                    } else {
+                        alert('❌ Token is invalid or expired!\\n' + (data.error || ''));
+                    }
+                    setTimeout(() => location.reload(), 1000);
+                })
+                .catch(error => {
+                    alert('Error testing token: ' + error);
+                });
+        }
+        
+        function refreshToken() {
+            if (!confirm('This will get a new token from Metropolis. Continue?')) return;
+            
+            const btn = event.target;
+            btn.disabled = true;
+            btn.innerHTML = '<span class="loading-spinner"></span> Getting new token...';
+            
+            fetch('/api/refresh-token', {method: 'POST'})
+                .then(response => response.json())
+                .then(data => {
+                    if (data.success) {
+                        alert('✅ Token refreshed successfully!');
+                        location.reload();
+                    } else {
+                        alert('❌ Failed to refresh token:\\n' + (data.error || 'Unknown error'));
+                        btn.disabled = false;
+                        btn.innerHTML = '<i class="fas fa-sync"></i> Get New Token';
+                    }
+                })
+                .catch(error => {
+                    alert('Error refreshing token: ' + error);
+                    btn.disabled = false;
+                    btn.innerHTML = '<i class="fas fa-sync"></i> Get New Token';
+                });
+        }
     </script>
     {% endblock %}
-    ''', member_count=len(member_plates))
+    ''', member_count=len(member_plates), token_info=token_info)
 
 @app.route('/login', methods=['GET', 'POST'])
 def login():
@@ -1254,6 +1656,73 @@ def api_search_transactions():
     html += '</tbody></table></div>'
     return jsonify({'html': html})
 
+@app.route('/api/test-token')
+@login_required
+def api_test_token():
+    """Test if the current token is valid"""
+    is_valid = verify_token()
+    return jsonify({
+        'valid': is_valid,
+        'error': token_status.get('error'),
+        'last_check': token_status.get('last_check').isoformat() if isinstance(token_status.get('last_check'), datetime) else None
+    })
+
+@app.route('/api/refresh-token', methods=['POST'])
+@login_required
+def api_refresh_token():
+    """Manually trigger token refresh"""
+    if not HAS_SELENIUM:
+        return jsonify({
+            'success': False,
+            'error': 'Selenium not installed. Please install selenium to enable token refresh.'
+        })
+    
+    try:
+        success = refresh_token_if_needed()
+        return jsonify({
+            'success': success,
+            'error': token_status.get('error') if not success else None
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'error': str(e)
+        })
+
+@app.route('/api/token-status')
+@login_required
+def api_token_status():
+    """Get current token status"""
+    return jsonify({
+        'valid': token_status.get('valid', False),
+        'last_check': token_status.get('last_check').isoformat() if isinstance(token_status.get('last_check'), datetime) else None,
+        'last_refresh': token_status.get('last_refresh').isoformat() if isinstance(token_status.get('last_refresh'), datetime) else None,
+        'error': token_status.get('error'),
+        'auto_refresh_enabled': AUTO_TOKEN_REFRESH and HAS_SELENIUM,
+        'selenium_available': HAS_SELENIUM
+    })
+
 if __name__ == '__main__':
+    # Try to load token from file if it exists
+    try:
+        with open('auth_token.txt', 'r') as f:
+            saved_token = f.read().strip()
+            if saved_token:
+                AUTH_KEY = saved_token
+                logger.info("Loaded token from auth_token.txt")
+    except:
+        pass
+    
+    # Start token monitor if enabled
+    if AUTO_TOKEN_REFRESH:
+        logger.info("Starting automatic token monitoring...")
+        start_token_monitor()
+    
+    # Verify initial token
+    logger.info("Verifying initial token...")
+    verify_token()
+    
+    # Start Flask app
     port = int(os.environ.get('PORT', 10000))
+    logger.info(f"Starting Flask app on port {port}...")
     app.run(host='0.0.0.0', port=port, debug=False)
